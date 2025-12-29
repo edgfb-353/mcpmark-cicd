@@ -102,15 +102,20 @@ jobs:
             // Priority labels (highest priority wins).
             const hasAny = (text, keywords) => keywords.some((k) => text.includes(k));
 
+            const isCritical = hasAny(combined, ['critical', 'urgent', 'production', 'outage']);
+            const isHigh = hasAny(combined, ['important', 'high', 'blocking']);
+            const isMedium = hasAny(combined, ['medium', 'normal']);
+            const isLow = hasAny(combined, ['low', 'nice-to-have', 'minor']);
+
             let desiredPriority = 'priority-medium';
-            if (hasAny(combined, ['critical', 'urgent', 'production', 'outage'])) {
+            if (isCritical) {
               desiredPriority = 'priority-critical';
-            } else if (hasAny(combined, ['important', 'high', 'blocking'])) {
+            } else if (isHigh) {
               desiredPriority = 'priority-high';
-            } else if (hasAny(combined, ['low', 'nice-to-have', 'minor'])) {
-              desiredPriority = 'priority-low';
-            } else if (hasAny(combined, ['medium', 'normal'])) {
+            } else if (isMedium) {
               desiredPriority = 'priority-medium';
+            } else if (isLow) {
+              desiredPriority = 'priority-low';
             }
 
             const priorityLabels = [
