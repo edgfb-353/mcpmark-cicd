@@ -8,6 +8,10 @@ permissions:
   issues: write
   contents: read
 
+concurrency:
+  group: issue-automation-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   issue-triage:
     name: Issue triage
@@ -253,7 +257,8 @@ jobs:
             const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
             const labels = (issue.labels || []).map((l) => l.name);
 
-            // Only respond once: if marker exists in any previous comment, skip.
+            // Determine whether we've already posted the auto-response comment.
+            let alreadyResponded = false;
             try {
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner,
@@ -261,18 +266,9 @@ jobs:
                 issue_number,
                 per_page: 100,
               });
-              if (comments.some((c) => (c.body || '').includes(marker))) {
-                core.info('Auto-response already posted; skipping.');
-                return;
-              }
+              alreadyResponded = comments.some((c) => (c.body || '').includes(marker));
             } catch (e) {
               core.warning(`Failed to list comments for idempotency check: ${e.message}`);
-            }
-
-            // Only move forward when the issue is in the triage state.
-            if (!labels.includes('needs-triage')) {
-              core.info("Issue is not labeled 'needs-triage'; skipping auto-response.");
-              return;
             }
 
             // Determine whether this is the author's first issue in this repo.
@@ -280,11 +276,23 @@ jobs:
             let isFirstIssueInRepo = false;
             if (author) {
               try {
-                const searchRes = await github.rest.search.issuesAndPullRequests({
-                  q: `repo:${owner}/${repo} is:issue author:${author}`,
-                  per_page: 1,
-                });
-                isFirstIssueInRepo = searchRes.data.total_count === 1;
+                const res = await github.graphql(
+                  `query($owner: String!, $repo: String!, $author: String!) {
+                    repository(owner: $owner, name: $repo) {
+                      issues(
+                        first: 1,
+                        orderBy: { field: CREATED_AT, direction: ASC },
+                        filterBy: { createdBy: $author }
+                      ) {
+                        nodes { number }
+                      }
+                    }
+                  }`,
+                  { owner, repo, author }
+                );
+
+                const firstNumber = res?.repository?.issues?.nodes?.[0]?.number;
+                isFirstIssueInRepo = firstNumber === issue_number;
               } catch (e) {
                 core.warning(`Failed first-issue check: ${e.message}`);
               }
@@ -341,12 +349,14 @@ jobs:
                 ].join('\n')
               : '';
 
-            const commentBody = `${welcomeBlock}${guidanceBlock}\n\n${marker}`;
-
-            try {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body: commentBody });
-            } catch (e) {
-              core.warning(`Failed creating auto-response comment: ${e.message}`);
+            const shouldPostComment = !alreadyResponded && labels.includes('needs-triage');
+            if (shouldPostComment) {
+              const commentBody = `${welcomeBlock}${guidanceBlock}\n\n${marker}`;
+              try {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body: commentBody });
+              } catch (e) {
+                core.warning(`Failed creating auto-response comment: ${e.message}`);
+              }
             }
 
             // Set milestone v1.0.0 for priority-high and priority-critical issues.
@@ -362,35 +372,53 @@ jobs:
 
                 let milestone = milestones.find((m) => m.title === 'v1.0.0');
                 if (!milestone) {
-                  const created = await github.rest.issues.createMilestone({
-                    owner,
-                    repo,
-                    title: 'v1.0.0',
-                    description: 'Automation-created milestone for v1.0.0 work.',
-                  });
-                  milestone = created.data;
+                  try {
+                    const created = await github.rest.issues.createMilestone({
+                      owner,
+                      repo,
+                      title: 'v1.0.0',
+                      description: 'Automation-created milestone for v1.0.0 work.',
+                    });
+                    milestone = created.data;
+                  } catch (e) {
+                    // If it already exists (or creation fails), attempt a fresh lookup.
+                    core.warning(`Milestone create failed (will retry lookup): ${e.message}`);
+                    const refreshed = await github.paginate(github.rest.issues.listMilestones, {
+                      owner,
+                      repo,
+                      state: 'all',
+                      per_page: 100,
+                    });
+                    milestone = refreshed.find((m) => m.title === 'v1.0.0');
+                  }
                 }
 
-                await github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number,
-                  milestone: milestone.number,
-                });
+                if (milestone) {
+                  await github.rest.issues.update({
+                    owner,
+                    repo,
+                    issue_number,
+                    milestone: milestone.number,
+                  });
+                }
               } catch (e) {
                 core.warning(`Failed setting milestone v1.0.0: ${e.message}`);
               }
             }
 
             // needs-triage -> needs-review
-            try {
-              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['needs-review'] });
-            } catch (e) {
-              core.warning(`Failed adding 'needs-review' label: ${e.message}`);
+            if (!labels.includes('needs-review')) {
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['needs-review'] });
+              } catch (e) {
+                core.warning(`Failed adding 'needs-review' label: ${e.message}`);
+              }
             }
 
-            try {
-              await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'needs-triage' });
-            } catch (e) {
-              if (e.status !== 404) core.warning(`Failed removing 'needs-triage' label: ${e.message}`);
+            if (labels.includes('needs-triage')) {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: 'needs-triage' });
+              } catch (e) {
+                if (e.status !== 404) core.warning(`Failed removing 'needs-triage' label: ${e.message}`);
+              }
             }
